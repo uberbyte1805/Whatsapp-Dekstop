@@ -30,6 +30,12 @@ finally reach every 1.6.1 install.
 
 ### Fixed
 
+- macOS: the app launches again on macOS 12 Monterey. The linker derived the bundle's minimum
+  macOS from the build host's SDK (13.0), so dyld refused to load the binary on anything older and
+  the documented "macOS 11.0+" requirement was silently false (#66, #67). The build now targets
+  12.0 — the oldest release the Go 1.26 runtime supports — and Info.plist declares
+  `LSMinimumSystemVersion`, so macOS warns before installing on an unsupported release instead of
+  failing after it.
 - Windows: the app closes normally again, and switching accounts no longer quits it. The session
   loop in `runApp` was `for !switchRequested` with the flag declared outside the loop, which put the
   two paths exactly the wrong way round: an ordinary close left the flag false, so the loop went

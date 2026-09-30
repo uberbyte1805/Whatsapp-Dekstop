@@ -1011,6 +1011,20 @@ func TestLinuxDoesNotForceContinuousCompositingOrPeriodicGC(t *testing.T) {
 	}
 }
 
+func TestMacBuildTargetsMontereyNotVentura(t *testing.T) {
+	source, err := os.ReadFile("build_mac.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(source)
+	if !strings.Contains(script, `export MACOSX_DEPLOYMENT_TARGET="12.0"`) {
+		t.Fatal("build_mac.sh must pin MACOSX_DEPLOYMENT_TARGET to 12.0: without it the linker defaults the binary to macOS 13, dyld refuses to load it on Monterey, and the documented requirement is silently false (#66, #67)")
+	}
+	if !strings.Contains(script, "<key>LSMinimumSystemVersion</key>") {
+		t.Fatal("the generated Info.plist must declare LSMinimumSystemVersion so macOS warns before installing on an unsupported release")
+	}
+}
+
 func TestDesktopWindowStateUsesResizeEventsNotPolling(t *testing.T) {
 	for _, file := range []string{"app_darwin.go", "app_windows.go", "app_linux.go"} {
 		source, err := os.ReadFile(file)

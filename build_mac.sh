@@ -12,6 +12,12 @@ RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 echo "Building universal binary for macOS (arm64 + x86_64)..."
 rm -f "${BINARY_NAME}_mac" "${BINARY_NAME}_arm64" "${BINARY_NAME}_amd64"
 
+# The linker derives LC_BUILD_VERSION's minos from this (SDK 14.2 defaults to
+# 13.0, which made the shipped binary refuse to load on Monterey and silently
+# falsified the README's macOS requirement — #66, #67). 12.0 is the floor the
+# Go 1.26 runtime itself supports.
+export MACOSX_DEPLOYMENT_TARGET="12.0"
+
 # cgo does not invalidate its object cache when a vendored C/C++ *header*
 # changes: Go hashes the package's .go/.c/.cc sources, not every transitively
 # included .h. Editing libs/webview/include/webview.h therefore kept reusing a
@@ -86,6 +92,8 @@ cat << EOF > "${CONTENTS_DIR}/Info.plist"
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSRequiresAquaSystemAppearance</key>
