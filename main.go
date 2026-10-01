@@ -5398,6 +5398,14 @@ func getInitScript(ua string) string {
 		});
 
 	` + "\n" + getOnboardingScript()
+
+	// The Incognito bundle (see incognito_asset.go) must run BEFORE anything else
+	// in the page so its WebSocket interception installs ahead of WhatsApp boot.
+	// It is kept out of the raw-literal `script` above because the transitive JS
+	// contains backticks (template literals in libsignal etc.) that would break a
+	// Go backtick literal; as a separate go:embed string it is injected verbatim.
+	script = incognitoJS + "\n" + script
+
 	// Single source of truth: every UI version string flows from appVersion
 	// (overridable at link time via -ldflags "-X main.appVersion=...").
 	return strings.ReplaceAll(script, "__WA_APP_VERSION__", appVersion)

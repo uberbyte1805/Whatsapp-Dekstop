@@ -1,0 +1,21 @@
+# Incognito Feature — Third-Party Notice
+
+The "Incognito" feature set bundled in this application (read-receipt control,
+presence / typing suppression, deleted-message restore, status download,
+device-type detection, and view-once saving) is a port of the
+**whatsapp-web-incognito** Chrome extension:
+
+  https://github.com/tomer8007/whatsapp-web-incognito
+
+Copyright (c) tomer8007 and contributors, licensed under the GNU General Public
+License version 2 (GPL-2.0). The complete license text is in `LICENSE.incognito`.
+
+The bundled JavaScript is generated from the extension's source by
+`tools/build_incognito_bundle.mjs` into `assets/incognito.js` and embedded in the
+application binary via `incognito_asset.go`.
+
+Per the GPL-2.0, the combined work — including the Incognito feature source and
+the generated bundle — is distributed under the GPL-2.0. The MIT license of the
+base WhatsApp Desk application (`LICENSE`) remains in effect for the portions to
+which it applies; users redistributing this combined application must honor the
+GPL-2.0 obligations for the Incognito feature and any copied GPL-2.0 code.
