@@ -225,6 +225,22 @@ func getInitScript(ua string) string {
 			function dispatchNativeNotification(title, options) {
 				options = options || {};
 				var body = options.body || '';
+				// WhatsApp Web frequently sends a bare/empty body on the first
+				// notification of a burst (the preview text lives in 'data' or
+				// arrives one event later) and on silent updates, which
+				// surfaces as a blank Windows toast. Pull the richest text from
+				// the fields WA actually populates so the toast always shows
+				// message content instead of an empty bubble.
+				if (!body && options.data) {
+					var d = options.data;
+					body = d.body || d.message || d.text || d.preview ||
+						d.content || d.notificationBody || '';
+					if (!body && d.senderName && d.body === undefined) body = '';
+				}
+				// A group/one-to-one preview may also ride options.silent or a
+				// bare title when body is truly absent — fall back to a neutral
+				// hint only when we have a real heading, never emit an empty toast.
+				if (!body && !title) return;
 				if (notificationsStateReady && notificationsEnabled && window.sendNativeNotification) {
 					window.sendNativeNotification(title, body);
 				}
