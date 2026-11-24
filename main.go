@@ -3007,6 +3007,282 @@ func getInitScript(ua string) string {
 			}
 		});
 
+		// --- Restore deleted messages -------------------------------------
+		// WhatsApp replaces the bubble with a "this message was deleted" notice
+		// and the original text is gone from the store. This keeps a bounded
+		// in-memory copy of what was rendered in this session and puts it back
+		// when the notice appears.
+		//
+		// Deliberately DOM-only: no webpack internals, no stanza decoding, so it
+		// behaves the same on every engine. The cache never touches disk, which
+		// keeps deleted content out of the profile directory.
+		waRunModule('restore-deleted', function() {
+			var PREF = 'wa-desk-restore-deleted';
+			var enabled = storageGet(PREF) !== '0';
+			var CACHE_LIMIT = 800;
+			var cache = new Map();
+			var restoredCount = 0;
+
+			// Inert until a bubble is actually marked, so it is safe to install
+			// even while the feature is off.
+			try {
+				var style = document.createElement('style');
+				style.id = 'wa-restore-deleted-style';
+				style.textContent = '[data-wa-restored-bubble="1"]{outline:1px dashed rgba(0,168,132,.45);outline-offset:3px;border-radius:6px;}';
+				(document.head || document.documentElement).appendChild(style);
+			} catch (e) {}
+
+			// Locale list is a heuristic: the notice is the only signal the page
+			// gives us. Unknown locales simply do not restore.
+			var DELETED_PATTERNS = [
+				/this message was deleted/i,
+				/you deleted this message/i,
+				/pesan ini telah dihapus/i,
+				/pesan ini dihapus/i,
+				/anda menghapus pesan ini/i,
+				/kamu menghapus pesan ini/i
+			];
+
+			function looksDeleted(text) {
+				if (!text) return false;
+				for (var i = 0; i < DELETED_PATTERNS.length; i++) {
+					if (DELETED_PATTERNS[i].test(text)) return true;
+				}
+				return false;
+			}
+
+			function textNode(row) {
+				return row.querySelector('.copyable-text') ||
+					row.querySelector('[data-testid="msg-text"]') ||
+					row.querySelector('[data-pre-plain-text]');
+			}
+
+			function textOf(row) {
+				var el = textNode(row);
+				if (!el) return '';
+				return String(el.innerText || el.textContent || '').trim();
+			}
+
+			function remember(id, text) {
+				if (!text || looksDeleted(text)) return;
+				if (cache.get(id) === text) return;
+				cache.set(id, text);
+				if (cache.size > CACHE_LIMIT) {
+					var oldest = cache.keys().next();
+					if (!oldest.done) cache.delete(oldest.value);
+				}
+			}
+
+			function restore(row, id) {
+				// Gate on the visible text, not on a marker attribute: a chat
+				// switch or virtualization can rebuild the bubble while the row
+				// element (and its attributes) survives, and then the notice
+				// would stay on screen even though the text is cached.
+				if (!looksDeleted(textOf(row))) return;
+				var original = cache.get(id);
+				if (!original) return;
+				var el = textNode(row);
+				if (!el) return;
+				var firstRestore = row.getAttribute('data-wa-restored') !== '1';
+
+				el.textContent = original;
+				// The badge is a sibling, never a child: textOf() reads the text
+				// node, and a badge inside it would end up cached as part of the
+				// message and then restored twice after a re-render.
+				if (!row.querySelector('[data-wa-restored-badge]')) {
+					var badge = document.createElement('span');
+					badge.textContent = ' · restored';
+					badge.setAttribute('data-wa-restored-badge', '1');
+					badge.style.cssText = 'font-size:10px;opacity:.6;font-style:italic;white-space:nowrap;';
+					if (el.parentNode) el.parentNode.insertBefore(badge, el.nextSibling);
+				}
+
+				row.setAttribute('data-wa-restored', '1');
+				var bubble = row.querySelector('[data-testid="msg-container"]') || row;
+				bubble.setAttribute('data-wa-restored-bubble', '1');
+				if (firstRestore) {
+					restoredCount++;
+					waDiag('restore', 'restored message ' + id.slice(-10) + ' (total ' + restoredCount + ')');
+				}
+			}
+
+			var scheduled = false;
+			function schedule() {
+				if (scheduled) return;
+				scheduled = true;
+				requestAnimationFrame(scan);
+			}
+
+			function scan() {
+				scheduled = false;
+				if (!enabled) return;
+				if (shouldPauseBackgroundWork()) { schedule(); return; }
+				var rows = document.querySelectorAll('#main [data-id]');
+				for (var i = 0; i < rows.length; i++) {
+					var row = rows[i];
+					var id = row.getAttribute('data-id');
+					if (!id) continue;
+					// Virtualized rows get reused for other messages; a different
+					// data-id means this is a new message, not a restored one.
+					if (row.getAttribute('data-wa-row-id') !== id) {
+						row.setAttribute('data-wa-row-id', id);
+						row.removeAttribute('data-wa-restored');
+					}
+					restore(row, id);
+					remember(id, textOf(row));
+				}
+			}
+
+			window.isRestoreDeletedEnabled = function() { return enabled; };
+			window.setRestoreDeletedEnabled = function(on) {
+				enabled = !!on;
+				storageSet(PREF, enabled ? '1' : '0');
+				if (enabled) schedule();
+				return enabled;
+			};
+			window.waRestoreDeletedStats = function() {
+				return { enabled: enabled, cached: cache.size, restored: restoredCount };
+			};
+
+			if (window.MutationObserver) {
+				var observer = new MutationObserver(schedule);
+				var start = function() {
+					var root = document.getElementById('main') || document.body;
+					if (root) {
+						try { observer.observe(root, { childList: true, subtree: true, characterData: true }); } catch (e) {}
+					}
+					schedule();
+				};
+				if (document.readyState === 'complete') setTimeout(start, 500);
+				else window.addEventListener('load', function() { setTimeout(start, 500); });
+			}
+			// Safety net for content that changed without a mutation we saw
+			// (virtualized re-renders, chat switches).
+			setInterval(function() { if (enabled && !document.hidden) scan(); }, 4000);
+		});
+
+		// --- Status download ----------------------------------------------
+		// Adds a "Save status" button while a photo or video status is open.
+		// The media URL is already a decrypted blob in the page, so fetching it
+		// needs no media keys and no protocol work; the bytes go through the
+		// app's existing chunked native save.
+		waRunModule('status-download', function() {
+			var PREF = 'wa-desk-status-download';
+			var enabled = storageGet(PREF) !== '0';
+			var BTN_ID = 'wa-status-dl-btn';
+
+			function findMedia() {
+				var img = document.querySelector('[data-animate-status-viewer] img');
+				if (img && img.src && img.naturalWidth > 0) return { el: img, kind: 'image' };
+				var video = document.querySelector('[data-testid="status-video"] video');
+				if (video && video.src) return { el: video, kind: 'video' };
+				return null;
+			}
+
+			function extFor(mime, kind) {
+				var m = String(mime || '').toLowerCase();
+				if (m.indexOf('jpeg') !== -1) return 'jpg';
+				if (m.indexOf('png') !== -1) return 'png';
+				if (m.indexOf('webp') !== -1) return 'webp';
+				if (m.indexOf('gif') !== -1) return 'gif';
+				if (m.indexOf('mp4') !== -1) return 'mp4';
+				if (m.indexOf('quicktime') !== -1) return 'mov';
+				if (m.indexOf('webm') !== -1) return 'webm';
+				return kind === 'video' ? 'mp4' : 'jpg';
+			}
+
+			function stamp() {
+				var d = new Date();
+				function p(n) { return (n < 10 ? '0' : '') + n; }
+				return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' +
+					p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+			}
+
+			function saveBlob(blob, filename) {
+				if (window.waSaveBlobChunked) return window.waSaveBlobChunked(blob, filename);
+				return new Promise(function(resolve, reject) {
+					if (!window.saveDownloadedFileNative) { reject(new Error('no native save bridge')); return; }
+					var reader = new FileReader();
+					reader.onload = function() {
+						Promise.resolve(window.saveDownloadedFileNative(filename, String(reader.result)))
+							.then(resolve, reject);
+					};
+					reader.onerror = function() { reject(reader.error || new Error('read failed')); };
+					reader.readAsDataURL(blob);
+				});
+			}
+
+			function download(btn, media) {
+				var original = btn.textContent;
+				btn.disabled = true;
+				btn.textContent = 'Saving...';
+				fetch(media.el.src)
+					.then(function(res) {
+						if (!res.ok) throw new Error('fetch ' + res.status);
+						return res.blob();
+					})
+					.then(function(blob) {
+						if (!blob || blob.size === 0) throw new Error('empty blob');
+						return saveBlob(blob, 'status-' + stamp() + '.' + extFor(blob.type, media.kind));
+					})
+					.then(function(savedPath) {
+						showFloatingToast('⬇ Status saved' + (savedPath ? ': ' + String(savedPath).split(/[\\/]/).pop() : ' to downloads'));
+						waDiag('status', 'saved ' + (savedPath || 'unknown path'));
+					})
+					.catch(function(err) {
+						showFloatingToast('⚠️ Could not save this status');
+						waDiag('status', 'save failed: ' + (err && err.message ? err.message : err));
+					})
+					.then(function() {
+						if (btn.parentNode) {
+							btn.disabled = false;
+							btn.textContent = original;
+						}
+					});
+			}
+
+			function tick() {
+				var existing = document.getElementById(BTN_ID);
+				if (!enabled) {
+					if (existing) existing.remove();
+					return;
+				}
+				var media = findMedia();
+				if (!media) {
+					if (existing) existing.remove();
+					return;
+				}
+				if (existing && existing.getAttribute('data-wa-src') === media.el.src) return;
+				if (existing) existing.remove();
+
+				var btn = document.createElement('button');
+				btn.id = BTN_ID;
+				btn.type = 'button';
+				btn.textContent = '⬇ Save status';
+				btn.setAttribute('data-wa-src', media.el.src);
+				btn.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647;' +
+					'background:rgba(0,0,0,.62);color:#fff;border:1px solid rgba(255,255,255,.32);' +
+					'border-radius:16px;padding:6px 14px;font-size:12px;font-weight:600;' +
+					'cursor:pointer;font-family:system-ui,sans-serif;backdrop-filter:blur(6px);';
+				btn.onclick = function(e) {
+					e.preventDefault();
+					e.stopPropagation();
+					download(btn, media);
+				};
+				document.body.appendChild(btn);
+			}
+
+			window.isStatusDownloadEnabled = function() { return enabled; };
+			window.setStatusDownloadEnabled = function(on) {
+				enabled = !!on;
+				storageSet(PREF, enabled ? '1' : '0');
+				tick();
+				return enabled;
+			};
+
+			setInterval(tick, 900);
+		});
+
 		// Always on Top Toggle (Cmd/Ctrl + Shift + T)
 		waRunModule('always-on-top', function() {
 			var isPinnedState = false;
@@ -4249,6 +4525,9 @@ func getInitScript(ua string) string {
 					throw err;
 				});
 			}
+			// Other modules (status download) save media through the same
+			// chunked bridge instead of growing their own copy of it.
+			window.waSaveBlobChunked = saveBlobChunked;
 
 			function captureDownload(href, filename, shouldAutoOpen) {
 				filename = resolveDownloadFilename(filename, '');
@@ -5136,6 +5415,28 @@ func getInitScript(ua string) string {
 					'<div class="wa-text-muted" id="wa-incognito-hint" style="font-size:10.5px;line-height:1.45;">Detecting WhatsApp internals...</div>';
 				quickGrid.appendChild(cardIncognito);
 
+				// Card 1c: Chat extras (restore deleted, status download)
+				var cardExtras = document.createElement('div');
+				cardExtras.className = 'wa-modal-card';
+				cardExtras.style.cssText = 'border-radius:0;border-width:0 0 1px;border-style:solid;padding:12px 0;display:flex;flex-direction:column;gap:8px;';
+				cardExtras.innerHTML = '' +
+					'<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">' +
+					'  <div style="flex:1;min-width:0;">' +
+					'    <strong class="wa-text-primary" style="font-size:12.5px;">Chat extras</strong>' +
+					'    <div class="wa-text-muted" style="font-size:11px;">Local only. Nothing is uploaded and nothing is written to disk.</div>' +
+					'  </div>' +
+					'</div>' +
+					'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">' +
+					'  <input type="checkbox" id="wa-restore-deleted" style="width:14px;height:14px;accent-color:#00a884;cursor:pointer;margin:0;" />' +
+					'  <span class="wa-text-muted" style="font-size:11px;">Restore deleted messages (kept in memory for this session)</span>' +
+					'</label>' +
+					'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">' +
+					'  <input type="checkbox" id="wa-status-download" style="width:14px;height:14px;accent-color:#00a884;cursor:pointer;margin:0;" />' +
+					'  <span class="wa-text-muted" style="font-size:11px;">Show a "Save status" button while viewing a photo/video status</span>' +
+					'</label>' +
+					'<div class="wa-text-muted" id="wa-extras-hint" style="font-size:10.5px;line-height:1.45;"></div>';
+				quickGrid.appendChild(cardExtras);
+
 				// Card 2: Always on Top
 				var cardPin = document.createElement('div');
 				cardPin.className = 'wa-modal-card';
@@ -5580,7 +5881,15 @@ func getInitScript(ua string) string {
 						refreshIncognitoBadge();
 					};
 				}
+				function refreshExtrasHint() {
+					var hint = document.getElementById('wa-extras-hint');
+					if (!hint || !window.waRestoreDeletedStats) return;
+					var stats = window.waRestoreDeletedStats();
+					hint.textContent = 'Session cache: ' + stats.cached + ' message(s), ' +
+						stats.restored + ' restored. Only messages seen since the last reload can be restored.';
+				}
 				refreshIncognitoBadge();
+				refreshExtrasHint();
 				// The hook scan is asynchronous, so keep the hint honest while the
 				// panel stays open instead of freezing the first snapshot.
 				var incognitoHintTimer = setInterval(function() {
@@ -5589,7 +5898,28 @@ func getInitScript(ua string) string {
 						return;
 					}
 					refreshIncognitoBadge();
+					refreshExtrasHint();
 				}, 2000);
+				var restoreDeletedBox = document.getElementById('wa-restore-deleted');
+				if (restoreDeletedBox) {
+					restoreDeletedBox.checked = !!(window.isRestoreDeletedEnabled && window.isRestoreDeletedEnabled());
+					restoreDeletedBox.onchange = function() {
+						if (window.setRestoreDeletedEnabled) window.setRestoreDeletedEnabled(restoreDeletedBox.checked);
+						showFloatingToast(restoreDeletedBox.checked ?
+							'♻️ Deleted messages will be restored' :
+							'♻️ Restore deleted messages: off');
+					};
+				}
+				var statusDownloadBox = document.getElementById('wa-status-download');
+				if (statusDownloadBox) {
+					statusDownloadBox.checked = !!(window.isStatusDownloadEnabled && window.isStatusDownloadEnabled());
+					statusDownloadBox.onchange = function() {
+						if (window.setStatusDownloadEnabled) window.setStatusDownloadEnabled(statusDownloadBox.checked);
+						showFloatingToast(statusDownloadBox.checked ?
+							'⬇ Status download button: on' :
+							'⬇ Status download button: off');
+					};
+				}
 				var idleReloadBox = document.getElementById('wa-idle-memory-reload');
 				if (idleReloadBox) {
 					idleReloadBox.checked = !!(window.getIdleMemoryReloadNative && window.getIdleMemoryReloadNative());

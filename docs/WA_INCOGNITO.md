@@ -28,8 +28,9 @@ the same behaviour.
 
 WAIncognito hooks `WebSocket` and decrypts the Noise protocol to read WhatsApp's
 binary XMPP stanzas, which needs libsignal, protobuf and WhatsApp's stanza
-parser (~200 KB of code). That is required for its heavier features (restoring
-deleted messages, device-type indicators, status downloads).
+parser (~200 KB of code). None of that is needed here: invisibility wraps the
+functions WhatsApp Web already calls to emit the updates, and the two chat
+extras work on the DOM (see below).
 
 For invisibility alone that machinery is unnecessary. WhatsApp Web already has
 functions that emit those updates, so this implementation wraps them:
@@ -50,6 +51,38 @@ decaying schedule and then every two minutes.
 The whole feature lives in `main.go` as the `waRunModule('incognito', ...)`
 block, so it behaves identically on every platform and needs no native code.
 
+## Chat extras
+
+Two of WAIncognito's features do not need protocol access either, so they are
+implemented as separate modules next to the incognito hooks.
+
+### Restore deleted messages
+
+`waRunModule('restore-deleted', ...)` keeps a bounded, in-memory copy of what is
+currently rendered in `#main` (800 messages, oldest evicted first). When a bubble
+is replaced with a "this message was deleted" notice, the cached text is put
+back and tagged with a small `· restored` badge.
+
+This is deliberately DOM-only. WhatsApp still deletes the message on its side
+and this does not touch the message store, so:
+
+- Only messages **seen in this session** can be restored. After a reload the
+  cache is empty and older deletions stay deleted.
+- The cache never touches disk, so deleted content does not end up in the
+  profile directory.
+- Restoring re-inserts text; media (photos, voice notes) is not recovered,
+  because the file was already removed from the page.
+- The notice is matched by text, with English and Indonesian patterns. Other
+  locales are not restored.
+
+### Status download
+
+`waRunModule('status-download', ...)` adds a **Save status** button while a photo
+or video status is open. The status media is already decrypted in the page as a
+`blob:` URL, so it is fetched and streamed through the app's existing chunked
+native save (`waSaveBlobChunked`) — no media keys, no direct-path rebuild. The
+file lands in the configured Downloads folder like any other media save.
+
 ## Settings
 
 Settings (`Ctrl+,`) → **WA Incognito**:
@@ -62,6 +95,11 @@ Settings (`Ctrl+,`) → **WA Incognito**:
 - **Block read receipts** — drops `sendReadReceipt` calls. Messages still get
   marked read locally, so the chat list behaves normally; the sender just never
   receives the blue ticks.
+
+Settings (`Ctrl+,`) → **Chat extras**:
+
+- **Restore deleted messages** — see above.
+- **Show a "Save status" button** — see above.
 
 Preferences are stored in `localStorage` and never leave the machine.
 
@@ -78,6 +116,11 @@ waIncognitoAllowRead(8000)
 setIncognitoOffline(false)
 setIncognitoTypingHidden(false)
 setIncognitoReadBlocked(false)
+
+// Chat extras.
+waRestoreDeletedStats()
+setRestoreDeletedEnabled(false)
+setStatusDownloadEnabled(false)
 ```
 
 ## Limitations
@@ -88,7 +131,9 @@ setIncognitoReadBlocked(false)
   but never read. WhatsApp does not treat this as an error.
 - Presence is what WhatsApp uses for the "online" dot. Blocking it also stops
   the app from reporting itself as online to your own other devices.
-- Features from WAIncognito that need protocol decoding (restore deleted
-  messages, "sent from phone/computer", status download) are not part of this
-  implementation. They would require the WebSocket/Noise layer and a separate
-  licensing review.
+- The **"sent from phone / computer"** indicator from WAIncognito is **not**
+  implemented. The sending device is only present in the encrypted stanza
+  attributes, so it cannot be read from the DOM; it would require the
+  WebSocket/Noise layer and a separate licensing review.
+- Restoring deleted messages recovers text only, and only for messages rendered
+  in the current session (see above).
