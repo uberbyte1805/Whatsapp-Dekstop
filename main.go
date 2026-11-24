@@ -2723,6 +2723,290 @@ func getInitScript(ua string) string {
 			}, true);
 		});
 
+		// --- WA Incognito -------------------------------------------------
+		// Invisible mode: never announce "online", never show a typing or
+		// recording indicator, never send read receipts (blue ticks).
+		//
+		// Unlike a browser extension there is no WebSocket/Noise layer here: the
+		// functions WhatsApp Web itself calls to emit those updates are wrapped
+		// instead. That keeps the whole feature to a few hundred lines, needs no
+		// protocol decoding, and behaves the same on WebKitGTK, WKWebView and
+		// WebView2. Preferences stay in localStorage; nothing leaves the machine.
+		//
+		// The module registry is discovered through the webpack chunk array (the
+		// same stable handle moduleRaid uses). Only factories whose source
+		// mentions a target function name are instantiated, so the scan never
+		// runs thousands of unrelated modules.
+		waRunModule('incognito', function() {
+			var PREF_OFFLINE = 'wa-desk-incognito-offline';
+			var PREF_TYPING = 'wa-desk-incognito-typing';
+			var PREF_READ = 'wa-desk-incognito-read';
+
+			// Defaults mirror the intent of the feature: invisible out of the box.
+			var incognito = {
+				offline: storageGet(PREF_OFFLINE) !== '0',
+				typing: storageGet(PREF_TYPING) !== '0',
+				read: storageGet(PREF_READ) !== '0'
+			};
+
+			var patched = { presence: false, typing: false, read: false };
+			var allowReadUntil = 0;
+			var reqRef = null;
+			var scanCount = 0;
+			var settleTimer = null;
+
+			function findRequire() {
+				if (reqRef) return reqRef;
+				var chunks = [];
+				try {
+					for (var key in window) {
+						if (!/^webpackChunk/i.test(key)) continue;
+						var arr = window[key];
+						if (arr && typeof arr.push === 'function') chunks.push(arr);
+					}
+				} catch (e) {}
+				for (var c = 0; c < chunks.length; c++) {
+					try {
+						chunks[c].push([['wa-incognito-' + Math.random().toString(36).slice(2)], {}, function(req) {
+							if (typeof req === 'function' && req.m) reqRef = req;
+						}]);
+					} catch (e) {}
+					if (reqRef) return reqRef;
+				}
+				return reqRef;
+			}
+
+			function moduleIdsMentioning(names) {
+				var req = findRequire();
+				if (!req || !req.m) return [];
+				var ids = Object.keys(req.m);
+				var found = [];
+				for (var i = 0; i < ids.length; i++) {
+					var src = '';
+					try { src = String(req.m[ids[i]]); } catch (e) { continue; }
+					if (!src) continue;
+					for (var n = 0; n < names.length; n++) {
+						if (src.indexOf(names[n]) !== -1) { found.push(ids[i]); break; }
+					}
+				}
+				return found;
+			}
+
+			function holdersOf(id) {
+				var req = findRequire();
+				if (!req) return [];
+				var mod = null;
+				try { mod = req(id); } catch (e) { return []; }
+				var out = [];
+				if (mod && (typeof mod === 'object' || typeof mod === 'function')) out.push(mod);
+				if (mod && mod.default && mod.default !== mod) out.push(mod.default);
+				return out;
+			}
+
+			// Wraps holder[name] once. Re-wrapping is a no-op so repeated scans
+			// cannot stack layers and slow the send path down.
+			function wrapFn(holder, name, factory) {
+				if (!holder || typeof holder[name] !== 'function') return false;
+				var orig = holder[name];
+				if (orig.__waIncognito) return true;
+				var wrapped;
+				try {
+					wrapped = factory(orig);
+					wrapped.__waIncognito = true;
+					wrapped.__waOriginal = orig;
+					holder[name] = wrapped;
+				} catch (e) {
+					return false;
+				}
+				return true;
+			}
+
+			function argsSayAvailable(args) {
+				for (var i = 0; i < args.length; i++) {
+					var a = args[i];
+					if (a === 'available') return true;
+					if (a && typeof a === 'object') {
+						if (a.type === 'available' || a.status === 'available' || a.presence === 'available') return true;
+					}
+				}
+				return false;
+			}
+
+			function presenceWrapper(orig, alwaysAvailable) {
+				return function() {
+					if (!incognito.offline) return orig.apply(this, arguments);
+					if (!alwaysAvailable && !argsSayAvailable(arguments)) return orig.apply(this, arguments);
+					// Swallow the announcement so the server keeps the account offline.
+					return undefined;
+				};
+			}
+
+			var TYPING_STATES = { composing: 1, paused: 1, recording: 1 };
+			function typingWrapper(orig) {
+				return function() {
+					if (!incognito.typing) return orig.apply(this, arguments);
+					for (var i = 0; i < arguments.length; i++) {
+						var a = arguments[i];
+						if (typeof a === 'string' && TYPING_STATES[a]) return undefined;
+						if (a && typeof a === 'object') {
+							if (TYPING_STATES[a.type] || TYPING_STATES[a.state] || TYPING_STATES[a.chatState]) return undefined;
+						}
+					}
+					return orig.apply(this, arguments);
+				};
+			}
+
+			function readWrapper(orig) {
+				return function() {
+					if (!incognito.read) return orig.apply(this, arguments);
+					if (Date.now() < allowReadUntil) return orig.apply(this, arguments);
+					return undefined;
+				};
+			}
+
+			function patchGroup(names, install) {
+				var ids = moduleIdsMentioning(names);
+				var hit = false;
+				for (var i = 0; i < ids.length; i++) {
+					var holders = holdersOf(ids[i]);
+					for (var h = 0; h < holders.length; h++) {
+						try {
+							if (install(holders[h])) hit = true;
+						} catch (e) {}
+					}
+				}
+				return hit;
+			}
+
+			function patchPresence() {
+				return patchGroup(
+					['sendPresenceAvailable', 'sendPresenceUpdate', 'sendPresenceStatusProtocol'],
+					function(holder) {
+						var hit = false;
+						if (wrapFn(holder, 'sendPresenceAvailable', function(orig) { return presenceWrapper(orig, true); })) hit = true;
+						if (wrapFn(holder, 'sendPresenceUpdate', function(orig) { return presenceWrapper(orig, false); })) hit = true;
+						if (wrapFn(holder, 'sendPresenceStatusProtocol', function(orig) { return presenceWrapper(orig, false); })) hit = true;
+						return hit;
+					}
+				);
+			}
+
+			function patchTyping() {
+				return patchGroup(
+					['sendChatState', 'sendChatStateUpdate', 'sendTypingState'],
+					function(holder) {
+						var hit = false;
+						if (wrapFn(holder, 'sendChatState', typingWrapper)) hit = true;
+						if (wrapFn(holder, 'sendChatStateUpdate', typingWrapper)) hit = true;
+						if (wrapFn(holder, 'sendTypingState', typingWrapper)) hit = true;
+						return hit;
+					}
+				);
+			}
+
+			function patchRead() {
+				return patchGroup(
+					['sendReadReceipt'],
+					function(holder) {
+						return wrapFn(holder, 'sendReadReceipt', readWrapper);
+					}
+				);
+			}
+
+			// Tells the server we are gone. Only used when the user flips the
+			// offline switch on: if the account was already announced as online,
+			// swallowing later "available" calls alone would leave it online.
+			function announceOffline() {
+				var ids = moduleIdsMentioning(['sendPresenceUnavailable']);
+				for (var i = 0; i < ids.length; i++) {
+					var holders = holdersOf(ids[i]);
+					for (var h = 0; h < holders.length; h++) {
+						var holder = holders[h];
+						if (!holder || typeof holder.sendPresenceUnavailable !== 'function') continue;
+						try { holder.sendPresenceUnavailable(); } catch (e) {}
+					}
+				}
+			}
+
+			function scan() {
+				scanCount++;
+				patched.presence = patched.presence || patchPresence();
+				patched.typing = patched.typing || patchTyping();
+				patched.read = patched.read || patchRead();
+				waDiag('incognito', 'scan ' + scanCount + ' presence=' + patched.presence +
+					' typing=' + patched.typing + ' read=' + patched.read);
+				return patched.presence && patched.typing && patched.read;
+			}
+
+			// WhatsApp boots its modules over the first seconds, and lazily loads
+			// more later, so the registry is polled on a decaying schedule instead
+			// of once. Once everything is patched only a slow re-check remains, in
+			// case a module object gets replaced under us.
+			function startScanning() {
+				var delays = [0, 150, 400, 900, 1600, 2500, 4000, 6000, 9000, 14000, 20000, 30000];
+				for (var i = 0; i < delays.length; i++) {
+					(function(d) {
+						setTimeout(function() {
+							if (scan() && !settleTimer) {
+								settleTimer = setInterval(function() { scan(); }, 120000);
+							}
+						}, d);
+					})(delays[i]);
+				}
+			}
+
+			window.isIncognitoOffline = function() { return incognito.offline; };
+			window.isIncognitoTypingHidden = function() { return incognito.typing; };
+			window.isIncognitoReadBlocked = function() { return incognito.read; };
+
+			window.setIncognitoOffline = function(on) {
+				incognito.offline = !!on;
+				storageSet(PREF_OFFLINE, on ? '1' : '0');
+				if (on) {
+					scan();
+					announceOffline();
+				}
+				return incognito.offline;
+			};
+			window.setIncognitoTypingHidden = function(on) {
+				incognito.typing = !!on;
+				storageSet(PREF_TYPING, on ? '1' : '0');
+				if (on) scan();
+				return incognito.typing;
+			};
+			window.setIncognitoReadBlocked = function(on) {
+				incognito.read = !!on;
+				storageSet(PREF_READ, on ? '1' : '0');
+				if (on) scan();
+				return incognito.read;
+			};
+
+			// One-shot escape hatch: let the next receipts through, e.g. to turn
+			// the grey ticks blue on purpose without disabling the feature.
+			window.waIncognitoAllowRead = function(ms) {
+				allowReadUntil = Date.now() + (ms || 8000);
+				return allowReadUntil;
+			};
+
+			window.waIncognitoStatus = function() {
+				return {
+					offline: incognito.offline,
+					typing: incognito.typing,
+					read: incognito.read,
+					scans: scanCount,
+					patched: { presence: patched.presence, typing: patched.typing, read: patched.read }
+				};
+			};
+
+			// Start after the first paint so the module scan never competes with
+			// WhatsApp's own boot sequence.
+			if (document.readyState === 'complete') {
+				setTimeout(startScanning, 300);
+			} else {
+				window.addEventListener('load', function() { setTimeout(startScanning, 300); });
+			}
+		});
+
 		// Always on Top Toggle (Cmd/Ctrl + Shift + T)
 		waRunModule('always-on-top', function() {
 			var isPinnedState = false;
@@ -4823,6 +5107,35 @@ func getInitScript(ua string) string {
 					'</label>';
 				quickGrid.appendChild(cardPrivacy);
 
+				// Card 1b: WA Incognito
+				var cardIncognito = document.createElement('div');
+				cardIncognito.className = 'wa-modal-card';
+				cardIncognito.style.cssText = 'border-radius:0;border-width:0 0 1px;border-style:solid;padding:12px 0;display:flex;flex-direction:column;gap:8px;';
+				cardIncognito.innerHTML = '' +
+					'<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">' +
+					'  <div style="flex:1;min-width:0;">' +
+					'    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px;">' +
+					'      <strong class="wa-text-primary" style="font-size:12.5px;">WA Incognito</strong>' +
+					'      <span id="wa-badge-incognito" style="font-size:10px;padding:1px 5px;border-radius:4px;font-weight:600;">...</span>' +
+					'    </div>' +
+					'    <div class="wa-text-muted" style="font-size:11px;">Stay invisible while you keep reading. Nothing is sent to any server.</div>' +
+					'  </div>' +
+					'</div>' +
+					'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">' +
+					'  <input type="checkbox" id="wa-incognito-offline" style="width:14px;height:14px;accent-color:#00a884;cursor:pointer;margin:0;" />' +
+					'  <span class="wa-text-muted" style="font-size:11px;">Always appear offline (never announce "online")</span>' +
+					'</label>' +
+					'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">' +
+					'  <input type="checkbox" id="wa-incognito-typing" style="width:14px;height:14px;accent-color:#00a884;cursor:pointer;margin:0;" />' +
+					'  <span class="wa-text-muted" style="font-size:11px;">Hide typing and recording indicators</span>' +
+					'</label>' +
+					'<label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">' +
+					'  <input type="checkbox" id="wa-incognito-read" style="width:14px;height:14px;accent-color:#00a884;cursor:pointer;margin:0;" />' +
+					'  <span class="wa-text-muted" style="font-size:11px;">Block read receipts (ticks stay grey)</span>' +
+					'</label>' +
+					'<div class="wa-text-muted" id="wa-incognito-hint" style="font-size:10.5px;line-height:1.45;">Detecting WhatsApp internals...</div>';
+				quickGrid.appendChild(cardIncognito);
+
 				// Card 2: Always on Top
 				var cardPin = document.createElement('div');
 				cardPin.className = 'wa-modal-card';
@@ -5210,6 +5523,73 @@ func getInitScript(ua string) string {
 							'🙉 Profile photos: visible');
 					};
 				}
+				var incognitoBadge = document.getElementById('wa-badge-incognito');
+				var incognitoHint = document.getElementById('wa-incognito-hint');
+				function refreshIncognitoBadge() {
+					var status = window.waIncognitoStatus ? window.waIncognitoStatus() : null;
+					if (!status) {
+						if (incognitoBadge) incognitoBadge.textContent = 'n/a';
+						if (incognitoHint) incognitoHint.textContent = 'Incognito module did not load. Reload the chat and try again.';
+						return;
+					}
+					var active = status.offline || status.typing || status.read;
+					if (incognitoBadge) incognitoBadge.textContent = active ? 'ACTIVE' : 'OFF';
+					if (!incognitoHint) return;
+					// The scan can still be running right after a reload; say so
+					// instead of claiming a hook is missing.
+					if (status.scans === 0) {
+						incognitoHint.textContent = 'Waiting for WhatsApp to finish loading...';
+						return;
+					}
+					var marks = [];
+					marks.push('offline ' + (status.patched.presence ? '✓' : '…'));
+					marks.push('typing ' + (status.patched.typing ? '✓' : '…'));
+					marks.push('receipts ' + (status.patched.read ? '✓' : '…'));
+					incognitoHint.textContent = 'Hooks: ' + marks.join(' · ') + ' (scan ' + status.scans + ')';
+				}
+				var incognitoOfflineBox = document.getElementById('wa-incognito-offline');
+				if (incognitoOfflineBox) {
+					incognitoOfflineBox.checked = !!(window.isIncognitoOffline && window.isIncognitoOffline());
+					incognitoOfflineBox.onchange = function() {
+						if (window.setIncognitoOffline) window.setIncognitoOffline(incognitoOfflineBox.checked);
+						showFloatingToast(incognitoOfflineBox.checked ?
+							'🕶️ Incognito: always offline' :
+							'👁️ Incognito: presence visible again');
+						refreshIncognitoBadge();
+					};
+				}
+				var incognitoTypingBox = document.getElementById('wa-incognito-typing');
+				if (incognitoTypingBox) {
+					incognitoTypingBox.checked = !!(window.isIncognitoTypingHidden && window.isIncognitoTypingHidden());
+					incognitoTypingBox.onchange = function() {
+						if (window.setIncognitoTypingHidden) window.setIncognitoTypingHidden(incognitoTypingBox.checked);
+						showFloatingToast(incognitoTypingBox.checked ?
+							'🕶️ Typing indicator hidden' :
+							'👁️ Typing indicator visible again');
+						refreshIncognitoBadge();
+					};
+				}
+				var incognitoReadBox = document.getElementById('wa-incognito-read');
+				if (incognitoReadBox) {
+					incognitoReadBox.checked = !!(window.isIncognitoReadBlocked && window.isIncognitoReadBlocked());
+					incognitoReadBox.onchange = function() {
+						if (window.setIncognitoReadBlocked) window.setIncognitoReadBlocked(incognitoReadBox.checked);
+						showFloatingToast(incognitoReadBox.checked ?
+							'🕶️ Read receipts blocked' :
+							'👁️ Read receipts sent again');
+						refreshIncognitoBadge();
+					};
+				}
+				refreshIncognitoBadge();
+				// The hook scan is asynchronous, so keep the hint honest while the
+				// panel stays open instead of freezing the first snapshot.
+				var incognitoHintTimer = setInterval(function() {
+					if (!document.getElementById('wa-incognito-hint')) {
+						clearInterval(incognitoHintTimer);
+						return;
+					}
+					refreshIncognitoBadge();
+				}, 2000);
 				var idleReloadBox = document.getElementById('wa-idle-memory-reload');
 				if (idleReloadBox) {
 					idleReloadBox.checked = !!(window.getIdleMemoryReloadNative && window.getIdleMemoryReloadNative());
