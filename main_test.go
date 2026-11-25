@@ -996,6 +996,80 @@ func TestMediaObserverScansOnlyAddedSubtrees(t *testing.T) {
 	}
 }
 
+// TestImagePasteFallsBackToTheToolkit guards the clipboard-image paste path.
+// WebKitGTK delivers an image paste with clipboardData.types empty, zero items
+// and zero files, so WhatsApp's paste handler finds nothing to upload and the
+// paste silently does nothing — copying an image worked, pasting it did not.
+// The page must therefore detect the empty payload, ask the native bridge for
+// the picture, and stage it as a file. Two things must stay true: the native
+// call only happens for an empty payload (a real text/file paste belongs to
+// WhatsApp), and the default paste is suppressed only after a usable file
+// exists, so a clipboard the toolkit cannot decode still pastes normally.
+func TestImagePasteFallsBackToTheToolkit(t *testing.T) {
+	script := getInitScript("test-agent")
+
+	for _, want := range []string{
+		"document.addEventListener('paste', handlePaste, true)",
+		"window.readClipboardImageNative",
+		"function pasteCarriesData(dt) {",
+		"function dataUrlToFile(dataUrl, name) {",
+		"dt.getData('text/plain')",
+		"dt.getData('text/html')",
+		"dt.getData('text/uri-list')",
+		"dt.items.length",
+		"dt.files.length",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script is missing clipboard-image paste safeguard %q", want)
+		}
+	}
+
+	pasteIdx := strings.Index(script, "function handlePaste(e) {")
+	if pasteIdx == -1 {
+		t.Fatal("script is missing the handlePaste function")
+	}
+	body := script[pasteIdx:]
+	if end := strings.Index(body, "document.addEventListener('dragenter'"); end != -1 {
+		body = body[:end]
+	}
+
+	// A paste that already carries data must be left to WhatsApp untouched.
+	if !strings.Contains(body, "if (pasteCarriesData(e.clipboardData))") {
+		t.Error("handlePaste must bail out when the page payload is not empty")
+	}
+	// Suppressing the default paste before knowing a file exists would break
+	// pasting anything the toolkit cannot decode.
+	dataUrlIdx := strings.Index(body, "if (!dataUrl) {")
+	preventIdx := strings.Index(body, "e.preventDefault()")
+	if dataUrlIdx == -1 || preventIdx == -1 {
+		t.Fatal("handlePaste must check the native result before suppressing the default paste")
+	}
+	if preventIdx < dataUrlIdx {
+		t.Error("handlePaste suppresses the default paste before the native image is known to exist")
+	}
+	// The image must reach the chat through the same injection path a drop uses.
+	if !strings.Contains(body, "injectFiles([file], 0, true)") {
+		t.Error("handlePaste must stage the clipboard image through injectFiles")
+	}
+}
+
+func TestLinuxBindsClipboardImageBridge(t *testing.T) {
+	source, err := os.ReadFile("app_linux.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(source)
+	if !strings.Contains(content, `_ = w.Bind("readClipboardImageNative"`) {
+		t.Fatal("Linux must bind readClipboardImageNative: WebKitGTK hides clipboard images from the paste event, so the page cannot recover them without the toolkit")
+	}
+	if !strings.Contains(content, "readClipboardImageBase64") {
+		t.Fatal("app_linux.go must implement the clipboard image reader")
+	}
+	if !strings.Contains(content, "gtk_clipboard_wait_for_image") {
+		t.Fatal("the clipboard image reader must use GTK to read the selection")
+	}
+}
+
 func TestLinuxDoesNotForceContinuousCompositingOrPeriodicGC(t *testing.T) {
 	source, err := os.ReadFile("app_linux.go")
 	if err != nil {

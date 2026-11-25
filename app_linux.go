@@ -28,6 +28,39 @@ static void setWhatsAppDeskGTKTheme(int mode) {
 	g_object_set(settings, "gtk-application-prefer-dark-theme", preferDark, NULL);
 }
 
+// Read the clipboard image as a PNG data URL, or NULL when the clipboard
+// holds no image.
+//
+// WebKitGTK's own paste path does not surface images: a "paste" event fired
+// after copying a picture arrives with clipboardData.types empty, zero items
+// and zero files, so WhatsApp Web's paste handler sees nothing and silently
+// drops the paste. Text is unaffected because getData("text/plain") still
+// resolves. Reading the selection through GTK and handing the bytes back to
+// the page is the only reliable route on this engine.
+//
+// Must be called on the GTK thread: the wait_* calls pump a nested main loop
+// while the selection owner answers.
+static char* readClipboardImageBase64(void) {
+	GtkClipboard* cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+	if (!cb) return NULL;
+	if (!gtk_clipboard_wait_is_image_available(cb)) return NULL;
+	GdkPixbuf* pb = gtk_clipboard_wait_for_image(cb);
+	if (!pb) return NULL;
+	gchar* buf = NULL;
+	gsize len = 0;
+	GError* err = NULL;
+	gboolean ok = gdk_pixbuf_save_to_buffer(pb, &buf, &len, "png", &err, NULL);
+	g_object_unref(pb);
+	if (!ok) {
+		if (err) g_error_free(err);
+		g_free(buf);
+		return NULL;
+	}
+	gchar* b64 = g_base64_encode((const guchar*)buf, len);
+	g_free(buf);
+	return b64;
+}
+
 // Per-monitor window placement for GTK. Monitor connectors (e.g. "DP-1")
 // are stable across sessions, so each display remembers its own frame.
 // The returned static buffer is valid only until the next call.
@@ -830,6 +863,19 @@ func runApp() {
 
 		// Page-side diagnostics (drag & drop, document preview, switch steps).
 		_ = w.Bind("waDiagNative", diagLogFromPage)
+
+		// Clipboard image bridge. See readClipboardImageBase64: WebKitGTK
+		// hands an empty clipboardData to the page for an image paste, so the
+		// page asks the toolkit instead. Returns "" when the clipboard holds
+		// no image, which lets the page fall back to the normal paste path.
+		_ = w.Bind("readClipboardImageNative", func() string {
+			b64 := C.readClipboardImageBase64()
+			if b64 == nil {
+				return ""
+			}
+			defer C.g_free(C.gpointer(b64))
+			return "data:image/png;base64," + C.GoString(b64)
+		})
 
 		// Bind external link handler (xdg-open)
 		_ = w.Bind("openExternalLink", func(rawURL string) {

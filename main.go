@@ -1052,6 +1052,102 @@ func getInitScript(ua string) string {
 				if (input.files && input.files.length > 0) lastUploadAt = Date.now();
 			}
 
+			// WebKitGTK does not hand clipboard images to the page: a paste of a
+			// copied picture arrives with clipboardData.types empty, zero items
+			// and zero files. Text survives because getData("text/plain") still
+			// resolves, but WhatsApp's paste handler looks for files/items and
+			// therefore sees nothing to upload — the paste silently does
+			// nothing, which is why copying an image and pasting it into a chat
+			// appeared broken while copying itself worked fine.
+			//
+			// When the page payload is empty, ask the toolkit for the image over
+			// the native bridge and stage it through the same file-injection
+			// path an image drop uses. A paste that does carry data (text, a
+			// real file, a URL) is left entirely to WhatsApp.
+			var clipboardPasteInProgress = false;
+
+			function pasteCarriesData(dt) {
+				if (!dt) return false;
+				if (dt.files && dt.files.length > 0) return true;
+				if (dt.items && dt.items.length > 0) return true;
+				try {
+					if (dt.getData('text/plain')) return true;
+					if (dt.getData('text/html')) return true;
+					if (dt.getData('text/uri-list')) return true;
+				} catch (e) {}
+				return false;
+			}
+
+			function pasteTargetsComposer(e) {
+				var target = e.target;
+				if (target && target.closest && target.closest('#wa-settings-modal, #wa-doc-modal-overlay, #wa-onboarding-overlay')) {
+					return false;
+				}
+				// Only a real conversation has somewhere to stage an attachment.
+				return !!document.querySelector('#main footer');
+			}
+
+			function dataUrlToFile(dataUrl, name) {
+				try {
+					var comma = String(dataUrl).indexOf(',');
+					if (comma === -1) return null;
+					var header = dataUrl.slice(0, comma);
+					var mime = /data:([^;]+)/.exec(header);
+					var binary = atob(dataUrl.slice(comma + 1));
+					var bytes = new Uint8Array(binary.length);
+					for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+					return new File([bytes], name, { type: (mime && mime[1]) || 'image/png' });
+				} catch (e) {
+					return null;
+				}
+			}
+
+			function handlePaste(e) {
+				if (typeof window.readClipboardImageNative !== 'function') return;
+				if (!pasteTargetsComposer(e)) return;
+				if (pasteCarriesData(e.clipboardData)) {
+					// A real payload: WhatsApp handles text, files and URLs itself.
+					return;
+				}
+				if (clipboardPasteInProgress) return;
+				clipboardPasteInProgress = true;
+
+				var settled = false;
+				function release() {
+					if (settled) return;
+					settled = true;
+					clipboardPasteInProgress = false;
+				}
+
+				waDiag('paste', 'clipboardData empty; asking the toolkit for an image');
+				Promise.resolve(window.readClipboardImageNative()).then(function(dataUrl) {
+					if (!dataUrl) {
+						// Nothing to recover: an empty clipboard, or a format the
+						// toolkit cannot decode. Leave the paste alone.
+						waDiag('paste', 'toolkit clipboard holds no image');
+						release();
+						return;
+					}
+					var file = dataUrlToFile(dataUrl, 'pasted-image-' + Date.now() + '.png');
+					if (!file) {
+						waDiag('paste', 'could not decode the clipboard image');
+						release();
+						return;
+					}
+					// Only now, with a usable file in hand, suppress the default
+					// paste so the two paths cannot both stage an attachment.
+					try { e.preventDefault(); } catch (err) {}
+					lastUploadAt = Date.now();
+					dropInProgress = true;
+					waDiag('paste', 'staging clipboard image (' + file.size + ' bytes)');
+					injectFiles([file], 0, true);
+					setTimeout(release, 4000);
+				}).catch(function(err) {
+					waDiag('paste', 'toolkit clipboard read failed: ' + err);
+					release();
+				});
+			}
+
 			document.addEventListener('dragenter', handleDragEnter, true);
 			document.addEventListener('dragleave', handleDragLeave, true);
 			document.addEventListener('dragover', handleDragOver, true);
@@ -1062,6 +1158,7 @@ func getInitScript(ua string) string {
 			document.addEventListener('dragend', clearDragVisualState, true);
 			window.addEventListener('blur', clearDragVisualState);
 			document.addEventListener('change', handleFileInputChange, true);
+			document.addEventListener('paste', handlePaste, true);
 		});
 
 		// Helper: Decode base64 dataURI to Uint8Array
