@@ -37,16 +37,32 @@ functions that emit those updates, so this implementation wraps them:
 
 | Behaviour | Wrapped function |
 | --- | --- |
-| Online presence | `sendPresenceAvailable`, `sendPresenceUpdate`, `sendPresenceStatusProtocol` |
-| Typing / recording | `sendChatState`, `sendChatStateUpdate`, `sendTypingState` |
-| Read receipts | `sendReadReceipt` |
+| Online presence | `WAWebPresenceChatAction.sendPresenceAvailable` |
+| Typing / recording | `WAWebChatStateBridge.sendChatStateComposing` / `sendChatStatePaused` / `sendChatStateRecording` |
+| Read receipts | `WAWebSendReadReceiptJob.sendReceipt`, `WAWebSendReceiptJobCommon.sendAggregateReceipts` |
 
-The functions are found by reading the webpack chunk registry
-(`webpackChunkwhatsapp_web_client`) and inspecting module source for those
-names. Only matching factories are instantiated, so the scan never runs
-thousands of unrelated modules. Because WhatsApp boots its modules over the
-first seconds and lazily loads more later, the registry is re-scanned on a
-decaying schedule and then every two minutes.
+The current WhatsApp Web build is not webpack any more: modules are declared
+through a global `__d(id, deps, factory, flags)` with string ids such as
+`WAWebChatStateBridge`, and `webpackChunkwhatsapp_web_client` is an empty array
+with a native `push`, so the classic "push a fake chunk to grab
+`__webpack_require__`" trick yields nothing. Instead the feature installs a
+property trap on `window.__d` at document start, before the bundle runs. For
+the four modules above it wraps the factory, and the moment WhatsApp
+instantiates one, the exported functions are patched in place — whether the
+module publishes through `module.exports`, its return value, or a `.default`
+object.
+
+Two details matter for correctness:
+
+- `sendAggregateReceipts` also carries delivery receipts. Only `read` and
+  `read-self` entries are stripped from the batch; the rest is forwarded
+  untouched, otherwise the phone would keep resending messages.
+- Going *offline* is never blocked. Enabling incognito calls
+  `sendPresenceUnavailable` once so an account that was already announced
+  online actually disappears.
+
+Hooks attach when WhatsApp loads the socket modules, i.e. after the device is
+paired, so the Settings card shows `…` until then.
 
 The whole feature lives in `main.go` as the `waRunModule('incognito', ...)`
 block, so it behaves identically on every platform and needs no native code.

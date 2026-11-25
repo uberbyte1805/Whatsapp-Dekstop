@@ -2751,56 +2751,194 @@ func getInitScript(ua string) string {
 
 			var patched = { presence: false, typing: false, read: false };
 			var allowReadUntil = 0;
-			var reqRef = null;
 			var scanCount = 0;
 			var settleTimer = null;
+			var offlineAnnouncer = null;
+			var pendingOfflineAnnounce = false;
+			var receiptTypes = null;
+			var defineSeen = 0;
+			var hookedIds = [];
+			var probedIds = [];
+			var targetsSeen = [];
+			var lastLogKey = '';
 
-			function findRequire() {
-				if (reqRef) return reqRef;
-				var chunks = [];
+			// Which module owns which send call, and under what name. These were
+			// read out of a live bundle, not guessed: WAWebStreamModel decides
+			// when to announce presence but the wire call is
+			// WAWebPresenceChatAction.sendPresenceAvailable; typing is sent by
+			// WAWebChatStateBridge.sendChatStateComposing/Paused/Recording;
+			// read receipts leave through WAWebSendReadReceiptJob.sendReceipt
+			// and WAWebSendReceiptJobCommon.sendAggregateReceipts, which also
+			// carries delivery receipts and therefore gets filtered per receipt
+			// type instead of being dropped wholesale.
+			var TARGETS = {
+				WAWebPresenceChatAction: {
+					presence: ['sendPresenceAvailable']
+				},
+				WAWebChatStateBridge: {
+					typing: ['sendChatStateComposing', 'sendChatStatePaused', 'sendChatStateRecording']
+				},
+				WAWebSendReadReceiptJob: {
+					read: ['sendReceipt']
+				},
+				WAWebSendReceiptJobCommon: {
+					read: ['sendAggregateReceipts']
+				}
+			};
+
+			// WhatsApp Web defines its modules through a global
+			// __d(id, deps, factory, flags) and only instantiates one when
+			// something requires it. The first implementation pushed a fake
+			// chunk into webpackChunkwhatsapp_web_client, but this build exposes
+			// that array with a native push (and a getter/setter pair), so the
+			// callback never fired and every scan reported presence=false.
+			// Trapping __d at document-start is the hook that works: ids are
+			// plain strings, and wrapping the factory lets us patch the exports
+			// object the moment WhatsApp creates it.
+			function installDefineTrap() {
+				var realD = null;
+				var wrappedD = null;
+
+				function wrapD(orig) {
+					return function(id) {
+						defineSeen++;
+						var key = String(id);
+						if (!TARGETS[key]) return orig.apply(this, arguments);
+						if (targetsSeen.indexOf(key) === -1) {
+							targetsSeen.push(key);
+							waDiag('incognito', 'target module defined: ' + key);
+						}
+						var args = Array.prototype.slice.call(arguments);
+						var fi = -1;
+						for (var i = 1; i < args.length; i++) {
+							if (typeof args[i] === 'function') { fi = i; break; }
+						}
+						if (fi === -1) return orig.apply(this, arguments);
+						var factory = args[fi];
+						args[fi] = function() {
+							var exp = factory.apply(this, arguments);
+							// The factory may hand back the exports object, or
+							// mutate one of its own arguments (module.exports).
+							// Patching both keeps the hook independent of the
+							// module format's calling convention.
+							try { patchExports(key, exp, arguments); } catch (e) {}
+							return exp;
+						};
+						return orig.apply(this, args);
+					};
+				}
+
 				try {
-					for (var key in window) {
-						if (!/^webpackChunk/i.test(key)) continue;
-						var arr = window[key];
-						if (arr && typeof arr.push === 'function') chunks.push(arr);
-					}
-				} catch (e) {}
-				for (var c = 0; c < chunks.length; c++) {
-					try {
-						chunks[c].push([['wa-incognito-' + Math.random().toString(36).slice(2)], {}, function(req) {
-							if (typeof req === 'function' && req.m) reqRef = req;
-						}]);
-					} catch (e) {}
-					if (reqRef) return reqRef;
+					Object.defineProperty(window, '__d', {
+						configurable: true,
+						get: function() { return wrappedD || realD; },
+						set: function(v) {
+							realD = v;
+							wrappedD = typeof v === 'function' ? wrapD(v) : v;
+						}
+					});
+				} catch (e) {
+					waDiag('incognito', 'define trap failed: ' + e);
 				}
-				return reqRef;
 			}
 
-			function moduleIdsMentioning(names) {
-				var req = findRequire();
-				if (!req || !req.m) return [];
-				var ids = Object.keys(req.m);
-				var found = [];
-				for (var i = 0; i < ids.length; i++) {
-					var src = '';
-					try { src = String(req.m[ids[i]]); } catch (e) { continue; }
-					if (!src) continue;
-					for (var n = 0; n < names.length; n++) {
-						if (src.indexOf(names[n]) !== -1) { found.push(ids[i]); break; }
+			function patchExports(id, exp, callArgs) {
+				var spec = TARGETS[id];
+				if (!spec) return;
+				var holders = [];
+
+				function addHolder(v) {
+					if (!v) return;
+					var t = typeof v;
+					if (t !== 'object' && t !== 'function') return;
+					if (holders.indexOf(v) !== -1) return;
+					holders.push(v);
+					// module.exports is the usual way a Meta module publishes
+					// its surface, so follow it one level down.
+					var inner = v.exports;
+					if (inner && inner !== v && (typeof inner === 'object' || typeof inner === 'function') &&
+						holders.indexOf(inner) === -1) {
+						holders.push(inner);
+					}
+					var d = v.default;
+					if (d && d !== v && (typeof d === 'object' || typeof d === 'function') &&
+						holders.indexOf(d) === -1) {
+						holders.push(d);
 					}
 				}
-				return found;
-			}
 
-			function holdersOf(id) {
-				var req = findRequire();
-				if (!req) return [];
-				var mod = null;
-				try { mod = req(id); } catch (e) { return []; }
-				var out = [];
-				if (mod && (typeof mod === 'object' || typeof mod === 'function')) out.push(mod);
-				if (mod && mod.default && mod.default !== mod) out.push(mod.default);
-				return out;
+				addHolder(exp);
+				if (callArgs) {
+					for (var a = 0; a < callArgs.length; a++) addHolder(callArgs[a]);
+				}
+				if (!holders.length) return;
+
+				var got = { presence: false, typing: false, read: false };
+
+				for (var h = 0; h < holders.length; h++) {
+					var holder = holders[h];
+					if (!holder) continue;
+
+					// sendAggregateReceipts and RECEIPT_TYPE may live on the same
+					// object or not; remember the enum wherever it shows up so the
+					// receipt filter always has it.
+					if (!receiptTypes && holder.RECEIPT_TYPE && holder.RECEIPT_TYPE.READ) {
+						receiptTypes = holder.RECEIPT_TYPE;
+					}
+
+					for (var p = 0; spec.presence && p < spec.presence.length; p++) {
+						if (wrapFn(holder, spec.presence[p], presenceWrapper)) got.presence = true;
+					}
+					for (var t = 0; spec.typing && t < spec.typing.length; t++) {
+						if (wrapFn(holder, spec.typing[t], typingWrapper)) got.typing = true;
+					}
+					for (var r = 0; spec.read && r < spec.read.length; r++) {
+						var rname = spec.read[r];
+						var readHolder = holder;
+						var filterByType = rname === 'sendAggregateReceipts';
+						if (wrapFn(holder, rname, function(orig) {
+							return readWrapper(orig, readHolder, filterByType);
+						})) got.read = true;
+					}
+
+					// Kept so "go offline" can tell the server right away instead
+					// of only swallowing the next "available" announcement.
+					if (!offlineAnnouncer && typeof holder.sendPresenceUnavailable === 'function') {
+						offlineAnnouncer = function() {
+							try { holder.sendPresenceUnavailable(); } catch (e) {}
+						};
+						if (pendingOfflineAnnounce && incognito.offline) {
+							pendingOfflineAnnounce = false;
+							offlineAnnouncer();
+						}
+					}
+				}
+
+				if (got.presence) patched.presence = true;
+				if (got.typing) patched.typing = true;
+				if (got.read) patched.read = true;
+
+				var marks = [];
+				if (got.presence) marks.push('presence');
+				if (got.typing) marks.push('typing');
+				if (got.read) marks.push('read');
+				if (marks.length && hookedIds.indexOf(id) === -1) {
+					hookedIds.push(id);
+					waDiag('incognito', 'hooked ' + marks.join('+') + ' in ' + id);
+				} else if (!marks.length && probedIds.indexOf(id) === -1) {
+					// Instantiated but nothing matched: log the real export
+					// names once so a WhatsApp bundle change is obvious from
+					// the debug log instead of a silent no-op.
+					probedIds.push(id);
+					var names = [];
+					for (var k = 0; k < holders.length; k++) {
+						try {
+							names = names.concat(Object.getOwnPropertyNames(holders[k]).slice(0, 40));
+						} catch (e) {}
+					}
+					waDiag('incognito', 'no known send fn in ' + id +
+						'; exports=' + (names.join(',') || 'none'));
+				}
 			}
 
 			// Wraps holder[name] once. Re-wrapping is a no-op so repeated scans
@@ -2821,135 +2959,98 @@ func getInitScript(ua string) string {
 				return true;
 			}
 
-			function argsSayAvailable(args) {
-				for (var i = 0; i < args.length; i++) {
-					var a = args[i];
-					if (a === 'available') return true;
-					if (a && typeof a === 'object') {
-						if (a.type === 'available' || a.status === 'available' || a.presence === 'available') return true;
-					}
-				}
-				return false;
-			}
-
-			function presenceWrapper(orig, alwaysAvailable) {
+			// sendPresenceAvailable only exists to say "I am here", so when
+			// offline mode is on there is nothing to inspect: swallow it and the
+			// server keeps the account offline. Going the other way still works,
+			// because announceOffline() calls sendPresenceUnavailable directly.
+			function presenceWrapper(orig) {
 				return function() {
 					if (!incognito.offline) return orig.apply(this, arguments);
-					if (!alwaysAvailable && !argsSayAvailable(arguments)) return orig.apply(this, arguments);
-					// Swallow the announcement so the server keeps the account offline.
 					return undefined;
 				};
 			}
 
-			var TYPING_STATES = { composing: 1, paused: 1, recording: 1 };
+			// Only ever attached to functions that exist to send a chat state, so
+			// there is nothing to inspect: if typing is hidden, none of them run.
 			function typingWrapper(orig) {
 				return function() {
 					if (!incognito.typing) return orig.apply(this, arguments);
-					for (var i = 0; i < arguments.length; i++) {
-						var a = arguments[i];
-						if (typeof a === 'string' && TYPING_STATES[a]) return undefined;
-						if (a && typeof a === 'object') {
-							if (TYPING_STATES[a.type] || TYPING_STATES[a.state] || TYPING_STATES[a.chatState]) return undefined;
-						}
-					}
-					return orig.apply(this, arguments);
-				};
-			}
-
-			function readWrapper(orig) {
-				return function() {
-					if (!incognito.read) return orig.apply(this, arguments);
-					if (Date.now() < allowReadUntil) return orig.apply(this, arguments);
 					return undefined;
 				};
 			}
 
-			function patchGroup(names, install) {
-				var ids = moduleIdsMentioning(names);
-				var hit = false;
-				for (var i = 0; i < ids.length; i++) {
-					var holders = holdersOf(ids[i]);
-					for (var h = 0; h < holders.length; h++) {
-						try {
-							if (install(holders[h])) hit = true;
-						} catch (e) {}
-					}
-				}
-				return hit;
-			}
+			// sendAggregateReceipts takes a batch, and the same batch also carries
+			// delivery receipts. Dropping those would make the phone resend the
+			// messages, so only read/read-self entries are removed and the rest
+			// is forwarded untouched. Everywhere else the call is simply a read
+			// receipt and gets swallowed.
+			function readWrapper(orig, holder, filterByType) {
+				return function() {
+					if (!incognito.read) return orig.apply(this, arguments);
+					if (Date.now() < allowReadUntil) return orig.apply(this, arguments);
+					if (!filterByType) return undefined;
 
-			function patchPresence() {
-				return patchGroup(
-					['sendPresenceAvailable', 'sendPresenceUpdate', 'sendPresenceStatusProtocol'],
-					function(holder) {
-						var hit = false;
-						if (wrapFn(holder, 'sendPresenceAvailable', function(orig) { return presenceWrapper(orig, true); })) hit = true;
-						if (wrapFn(holder, 'sendPresenceUpdate', function(orig) { return presenceWrapper(orig, false); })) hit = true;
-						if (wrapFn(holder, 'sendPresenceStatusProtocol', function(orig) { return presenceWrapper(orig, false); })) hit = true;
-						return hit;
-					}
-				);
-			}
+					var types = (holder && holder.RECEIPT_TYPE) || receiptTypes;
+					if (!types) return orig.apply(this, arguments);
 
-			function patchTyping() {
-				return patchGroup(
-					['sendChatState', 'sendChatStateUpdate', 'sendTypingState'],
-					function(holder) {
-						var hit = false;
-						if (wrapFn(holder, 'sendChatState', typingWrapper)) hit = true;
-						if (wrapFn(holder, 'sendChatStateUpdate', typingWrapper)) hit = true;
-						if (wrapFn(holder, 'sendTypingState', typingWrapper)) hit = true;
-						return hit;
+					var batch = arguments[0];
+					var list = Object.prototype.toString.call(batch) === '[object Array]' ? batch : [batch];
+					var kept = [];
+					for (var i = 0; i < list.length; i++) {
+						var item = list[i];
+						var type = item && item.type;
+						if (type === types.READ || type === types.READ_SELF) continue;
+						kept.push(item);
 					}
-				);
-			}
+					if (!kept.length) return undefined;
 
-			function patchRead() {
-				return patchGroup(
-					['sendReadReceipt'],
-					function(holder) {
-						return wrapFn(holder, 'sendReadReceipt', readWrapper);
-					}
-				);
+					var args = Array.prototype.slice.call(arguments);
+					args[0] = kept;
+					return orig.apply(this, args);
+				};
 			}
 
 			// Tells the server we are gone. Only used when the user flips the
 			// offline switch on: if the account was already announced as online,
 			// swallowing later "available" calls alone would leave it online.
+			// The module may not be instantiated yet at that point, so remember
+			// the request and replay it as soon as the hook exists.
 			function announceOffline() {
-				var ids = moduleIdsMentioning(['sendPresenceUnavailable']);
-				for (var i = 0; i < ids.length; i++) {
-					var holders = holdersOf(ids[i]);
-					for (var h = 0; h < holders.length; h++) {
-						var holder = holders[h];
-						if (!holder || typeof holder.sendPresenceUnavailable !== 'function') continue;
-						try { holder.sendPresenceUnavailable(); } catch (e) {}
-					}
+				if (!offlineAnnouncer) {
+					pendingOfflineAnnounce = true;
+					return;
 				}
+				offlineAnnouncer();
 			}
 
 			function scan() {
 				scanCount++;
-				patched.presence = patched.presence || patchPresence();
-				patched.typing = patched.typing || patchTyping();
-				patched.read = patched.read || patchRead();
-				waDiag('incognito', 'scan ' + scanCount + ' presence=' + patched.presence +
-					' typing=' + patched.typing + ' read=' + patched.read);
+				var key = patched.presence + '/' + patched.typing + '/' + patched.read +
+					'/' + hookedIds.length + '/' + targetsSeen.length;
+				if (key !== lastLogKey) {
+					lastLogKey = key;
+					waDiag('incognito', 'scan ' + scanCount + ' presence=' + patched.presence +
+						' typing=' + patched.typing + ' read=' + patched.read +
+						' defined=' + defineSeen + ' targets=' + targetsSeen.length + '/' +
+						Object.keys(TARGETS).length + ' hooked=' + (hookedIds.join(',') || 'none'));
+				}
 				return patched.presence && patched.typing && patched.read;
 			}
 
-			// WhatsApp boots its modules over the first seconds, and lazily loads
-			// more later, so the registry is polled on a decaying schedule instead
-			// of once. Once everything is patched only a slow re-check remains, in
-			// case a module object gets replaced under us.
+			// The hooks install themselves the moment WhatsApp instantiates a
+			// module, so the schedule only refreshes the status line: a few quick
+			// looks while the app boots, then a slow heartbeat in case the user
+			// is still on the login screen (the socket modules only load after
+			// pairing).
 			function startScanning() {
 				var delays = [0, 150, 400, 900, 1600, 2500, 4000, 6000, 9000, 14000, 20000, 30000];
 				for (var i = 0; i < delays.length; i++) {
 					(function(d) {
 						setTimeout(function() {
-							if (scan() && !settleTimer) {
-								settleTimer = setInterval(function() { scan(); }, 120000);
-							}
+							var done = scan();
+							if (settleTimer) return;
+							if (done) settleTimer = setInterval(function() { scan(); }, 120000);
+							else if (d >= 30000) settleTimer = setInterval(function() { scan(); }, 60000);
 						}, d);
 					})(delays[i]);
 				}
@@ -2994,12 +3095,19 @@ func getInitScript(ua string) string {
 					typing: incognito.typing,
 					read: incognito.read,
 					scans: scanCount,
+					defined: defineSeen,
+					targets: targetsSeen.slice(),
+					hooked: hookedIds.slice(),
 					patched: { presence: patched.presence, typing: patched.typing, read: patched.read }
 				};
 			};
 
-			// Start after the first paint so the module scan never competes with
-			// WhatsApp's own boot sequence.
+			// Installed synchronously, before WhatsApp's bundle runs: the trap
+			// only sees a module if it is in place before __d is defined.
+			installDefineTrap();
+
+			// The status scan waits for the first paint so it never competes
+			// with WhatsApp's own boot sequence.
 			if (document.readyState === 'complete') {
 				setTimeout(startScanning, 300);
 			} else {
@@ -5846,7 +5954,12 @@ func getInitScript(ua string) string {
 					marks.push('offline ' + (status.patched.presence ? '✓' : '…'));
 					marks.push('typing ' + (status.patched.typing ? '✓' : '…'));
 					marks.push('receipts ' + (status.patched.read ? '✓' : '…'));
-					incognitoHint.textContent = 'Hooks: ' + marks.join(' · ') + ' (scan ' + status.scans + ')';
+					// The hooks attach themselves when WhatsApp loads the module
+					// that owns each send call, which only happens after pairing.
+					// Saying so beats a hint that looks stuck forever.
+					var ready = status.patched.presence && status.patched.typing && status.patched.read;
+					incognitoHint.textContent = 'Hooks: ' + marks.join(' · ') +
+						(ready ? '' : ' — attach after login');
 				}
 				var incognitoOfflineBox = document.getElementById('wa-incognito-offline');
 				if (incognitoOfflineBox) {
