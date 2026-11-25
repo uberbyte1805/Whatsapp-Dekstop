@@ -18,6 +18,7 @@ whatsapp-desktop
 *.deb
 dist_linux*/
 dist_win/
+WhatsApp-Desk-Linux-*
 rpms*/
 *Setup.exe
 SHA256SUMS

@@ -1311,8 +1311,6 @@ public:
     if (!m_webview) {
       return;
     }
-    gtk_container_add(GTK_CONTAINER(m_window), GTK_WIDGET(m_webview));
-    gtk_widget_show(GTK_WIDGET(m_webview));
     gtk_widget_grab_focus(GTK_WIDGET(m_webview));
   }
 
@@ -1385,6 +1383,16 @@ public:
       webkit_settings_set_enable_write_console_messages_to_stdout(settings,
                                                                   true);
       webkit_settings_set_enable_developer_extras(settings, true);
+    }
+
+    // Parent the widget here, not in the caller: this is the only place a
+    // browser widget is created, so both the initial construction and an
+    // in-place account swap get a visible web view. Leaving this to the
+    // caller made the very first window show nothing at all while the page
+    // still loaded and ran its scripts, which looked like a broken renderer.
+    if (m_window) {
+      gtk_container_add(GTK_CONTAINER(m_window), GTK_WIDGET(m_webview));
+      gtk_widget_show(GTK_WIDGET(m_webview));
     }
   }
 
